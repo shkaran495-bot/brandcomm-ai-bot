@@ -1,12 +1,13 @@
 import os
 import re
+import json
 from typing import Optional
 from pathlib import Path
 from datetime import datetime
 
 import httpx
 from fastapi import FastAPI, Request, Header
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, JSONResponse
 
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
@@ -28,7 +29,7 @@ GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", "").strip()
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 YEAR_FIXED = "2026"
 
-# ВАЖНО: токен хранится в Secret File Render
+# Secret File Render (read-only)
 TOKEN_PATH = Path("/etc/secrets/token.json")
 
 app = FastAPI()
@@ -80,10 +81,13 @@ async def oauth2callback(request: Request):
     flow.fetch_token(authorization_response=str(request.url))
     creds = flow.credentials
 
-    with open(TOKEN_PATH, "w") as f:
-        f.write(creds.to_json())
-
-    return {"status": "OAuth completed. Token saved permanently."}
+    # Показываем токен как JSON
+    return JSONResponse(
+        content={
+            "message": "СКОПИРУЙ ЭТО И ВСТАВЬ В Secret File token.json",
+            "token_json": json.loads(creds.to_json())
+        }
+    )
 
 
 def _drive_service():
@@ -138,7 +142,7 @@ def drive_get_or_create_folder(service, name: str, parent_id: str):
     ).execute()
 
 # =========================
-# Deal Structure (6 папок)
+# Deal Structure (8 папок)
 # =========================
 
 def build_deal_structure(service, client_name, deal_name):
@@ -155,7 +159,9 @@ def build_deal_structure(service, client_name, deal_name):
         "03_Договор_и_приложение",
         "04_Счета_и_закрывашки",
         "05_Макеты_и_векторы",
-        "06_Честный_знак",
+        "06_Закрывашки",
+        "07_Честный_знак",
+        "08_Фото_от_клиента",
     ]
 
     for folder in subfolders:
@@ -210,9 +216,6 @@ async def telegram_webhook(
 
     return {"ok": True}
 
-# =========================
-# Health
-# =========================
 
 @app.get("/health")
 def health():
