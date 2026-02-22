@@ -1,7 +1,7 @@
 import os
 import re
 import json
-from typing import Optional
+from typing import Optional, Dict, Any
 from pathlib import Path
 from datetime import datetime
 
@@ -26,13 +26,68 @@ GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "").strip()
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "").strip()
 GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", "").strip()
 
+# Optional fallback: store token JSON directly in env (Render Env Var)
+TOKEN_JSON_ENV = os.getenv("TOKEN_JSON", "").strip()
+
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 YEAR_FIXED = "2026"
 
-# Secret File Render (read-only)
+# Render Secret File path (read-only)
 TOKEN_PATH = Path("/etc/secrets/token.json")
 
 app = FastAPI()
+
+# =========================
+# Helpers / Validation
+# =========================
+
+def _missing_env() -> Dict[str, bool]:
+    return {
+        "TELEGRAM_BOT_TOKEN": not bool(TELEGRAM_BOT_TOKEN),
+        "GDRIVE_ROOT_FOLDER_ID": not bool(GDRIVE_ROOT_FOLDER_ID),
+        "GOOGLE_CLIENT_ID": not bool(GOOGLE_CLIENT_ID),
+        "GOOGLE_CLIENT_SECRET": not bool(GOOGLE_CLIENT_SECRET),
+        "GOOGLE_REDIRECT_URI": not bool(GOOGLE_REDIRECT_URI),
+    }
+
+def _google_client_config() -> Dict[str, Any]:
+    return {
+        "web": {
+            "client_id": GOOGLE_CLIENT_ID,
+            "client_secret": GOOGLE_CLIENT_SECRET,
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "redirect_uris": [GOOGLE_REDIRECT_URI],
+        }
+    }
+
+def _load_token_info() -> Dict[str, Any]:
+    """
+    Prefer Render Secret File /etc/secrets/token.json
+    Fallback to env var TOKEN_JSON (string with JSON)
+    """
+    if TOKEN_PATH.exists():
+        raw = TOKEN_PATH.read_text(encoding="utf-8").strip()
+        if not raw:
+            raise RuntimeError("token.json пустой. Заполни Secret File token.json на Render.")
+        try:
+            return json.loads(raw)
+        except Exception as e:
+            raise RuntimeError(f"token.json не валидный JSON: {e}")
+
+    if TOKEN_JSON_ENV:
+        try:
+            return json.loads(TOKEN_JSON_ENV)
+        except Exception as e:
+            raise RuntimeError(f"TOKEN_JSON env не валидный JSON: {e}")
+
+    raise RuntimeError("OAuth не пройден. Открой /auth и затем сохрани token.json в Render Secrets (или TOKEN_JSON).")
+
+
+def _drive_service():
+    token_info = _load_token_info()
+    creds = Credentials.from_authorized_user_info(token_info, SCOPES)
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 # =========================
 # OAuth
@@ -40,68 +95,72 @@ app = FastAPI()
 
 @app.get("/auth")
 def auth():
-    flow = Flow.from_client_config(
-        {
-            "web": {
-                "client_id": GOOGLE_CLIENT_ID,
-                "client_secret": GOOGLE_CLIENT_SECRET,
-                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-                "token_uri": "https://oauth2.googleapis.com/token",
-                "redirect_uris": [GOOGLE_REDIRECT_URI],
-            }
-        },
-        scopes=SCOPES,
-    )
+    missing = _missing_env()
+    if missing["GOOGLE_CLIENT_ID"] or missing["GOOGLE_CLIENT_SECRET"] or missing["GOOGLE_REDIRECT_URI"]:
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": "Не заданы GOOGLE_* переменные окружения на Render.",
+                "missing": {k: v for k, v in missing.items() if v},
+            },
+        )
 
+    flow = Flow.from_client_config(_google_client_config(), scopes=SCOPES)
     flow.redirect_uri = GOOGLE_REDIRECT_URI
+
     authorization_url, _ = flow.authorization_url(
         access_type="offline",
         prompt="consent",
+        include_granted_scopes="true",
     )
-
     return RedirectResponse(authorization_url)
 
 
 @app.get("/oauth2callback")
 async def oauth2callback(request: Request):
-    flow = Flow.from_client_config(
-        {
-            "web": {
-                "client_id": GOOGLE_CLIENT_ID,
-                "client_secret": GOOGLE_CLIENT_SECRET,
-                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-                "token_uri": "https://oauth2.googleapis.com/token",
-                "redirect_uris": [GOOGLE_REDIRECT_URI],
+    # Если тут раньше был Internal Server Error — теперь покажем причину
+    try:
+        missing = _missing_env()
+        if missing["GOOGLE_CLIENT_ID"] or missing["GOOGLE_CLIENT_SECRET"] or missing["GOOGLE_REDIRECT_URI"]:
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "error": "Не заданы GOOGLE_* переменные окружения на Render.",
+                    "missing": {k: v for k, v in missing.items() if v},
+                },
+            )
+
+        flow = Flow.from_client_config(_google_client_config(), scopes=SCOPES)
+        flow.redirect_uri = GOOGLE_REDIRECT_URI
+
+        # Важно: request.url должен совпадать с redirect URI доменом/путём
+        flow.fetch_token(authorization_response=str(request.url))
+        creds = flow.credentials
+
+        return JSONResponse(
+            content={
+                "message": "Скопируй token_json и вставь в Render -> Secret Files -> token.json (или в ENV TOKEN_JSON).",
+                "token_json": json.loads(creds.to_json()),
             }
-        },
-        scopes=SCOPES,
-    )
-
-    flow.redirect_uri = GOOGLE_REDIRECT_URI
-    flow.fetch_token(authorization_response=str(request.url))
-    creds = flow.credentials
-
-    # Показываем токен как JSON
-    return JSONResponse(
-        content={
-            "message": "СКОПИРУЙ ЭТО И ВСТАВЬ В Secret File token.json",
-            "token_json": json.loads(creds.to_json())
-        }
-    )
-
-
-def _drive_service():
-    if not TOKEN_PATH.exists():
-        raise RuntimeError("OAuth не пройден. Открой /auth")
-
-    creds = Credentials.from_authorized_user_file(str(TOKEN_PATH), SCOPES)
-    return build("drive", "v3", credentials=creds, cache_discovery=False)
+        )
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": "Ошибка при обработке oauth2callback",
+                "details": repr(e),
+                "hint": "Проверь GOOGLE_REDIRECT_URI (должен 1-в-1 совпадать с URL колбэка) и что он добавлен в Google Console.",
+                "got_url": str(request.url),
+            },
+        )
 
 # =========================
 # Utils
 # =========================
 
 async def tg_send_message(chat_id: int, text: str):
+    if not TELEGRAM_BOT_TOKEN:
+        return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     async with httpx.AsyncClient(timeout=30) as client:
         await client.post(url, json={"chat_id": chat_id, "text": text})
@@ -178,6 +237,7 @@ async def telegram_webhook(
     request: Request,
     x_telegram_bot_api_secret_token: Optional[str] = Header(default=None),
 ):
+    # Secret token check (optional)
     if TELEGRAM_SECRET_TOKEN:
         if (x_telegram_bot_api_secret_token or "") != TELEGRAM_SECRET_TOKEN:
             return {"ok": True}
@@ -205,22 +265,44 @@ async def telegram_webhook(
         client_name = safe_name(match.group(1))
         deal_name = safe_name(match.group(2))
 
-        service = _drive_service()
-        link = build_deal_structure(service, client_name, deal_name)
+        # Drive
+        try:
+            service = _drive_service()
+        except Exception as e:
+            # Раньше тут было 500. Теперь — норм сообщение в телегу.
+            await tg_send_message(
+                chat_id,
+                "❗️Google Drive не подключен.\n"
+                "Открой в браузере: /auth\n"
+                "Пройди OAuth и сохрани token.json в Render (Secret Files или TOKEN_JSON).\n\n"
+                f"Тех.детали: {repr(e)}"
+            )
+            return {"ok": True}
 
+        link = build_deal_structure(service, client_name, deal_name)
         await tg_send_message(chat_id, f"📁 Папка создана:\n{link}")
 
     except Exception as e:
-        print("Drive error:", repr(e))
-        await tg_send_message(chat_id, "Ошибка Drive")
+        print("Webhook error:", repr(e))
+        # Если даже тут упало — всё равно не 500 наружу
+        try:
+            msg = update.get("message") or {}
+            chat = msg.get("chat") or {}
+            chat_id = chat.get("id")
+            if chat_id:
+                await tg_send_message(chat_id, "Ошибка обработки. Проверь логи Render.")
+        except Exception:
+            pass
 
     return {"ok": True}
 
+# =========================
+# Health
+# =========================
 
 @app.get("/health")
 def health():
     return {"ok": True}
-
 
 @app.get("/")
 def root():
