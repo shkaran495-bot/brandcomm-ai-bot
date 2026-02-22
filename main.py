@@ -105,7 +105,8 @@ def _drive_service():
         raise RuntimeError("Google Drive env vars missing")
 
     clean_b64 = GOOGLE_SA_JSON_B64.strip()
-sa_info = json.loads(base64.b64decode(clean_b64).decode("utf-8"))
+    sa_info = json.loads(base64.b64decode(clean_b64).decode("utf-8"))
+
     creds = service_account.Credentials.from_service_account_info(
         sa_info,
         scopes=["https://www.googleapis.com/auth/drive"],
