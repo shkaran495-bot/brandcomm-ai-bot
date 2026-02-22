@@ -26,7 +26,7 @@ AIRTABLE_TABLE_DEALS = os.getenv("AIRTABLE_TABLE_DEALS", "Deals")
 GDRIVE_ROOT_FOLDER_ID = os.getenv("GDRIVE_ROOT_FOLDER_ID", "")
 
 # JSON сервисного аккаунта (base64) — безопасно хранить как env
-GOOGLE_SA_JSON_B64 = os.getenv("GOOGLE_SA_JSON_B64", "")
+GOOGLE_SA_JSON_B64 = os.getenv("GOOGLE_SA_JSON_B64", "").strip()
 
 # Webhook URL (Render даст после деплоя). Нужен чтобы поставить webhook.
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")  # например https://brandcomm-ai-bot.onrender.com
