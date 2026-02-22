@@ -2,10 +2,12 @@ import os
 import json
 import base64
 import re
+import asyncio
 from datetime import datetime
 from typing import Optional
 from pathlib import Path
 
+import anyio
 import httpx
 from fastapi import FastAPI, Request
 from pydantic import BaseModel
@@ -51,6 +53,8 @@ YEAR_FIXED = "2026"
 # Helpers: Telegram
 # -------------------------
 async def tg_send_message(chat_id: int, text: str):
+    if not TELEGRAM_BOT_TOKEN:
+        return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     async with httpx.AsyncClient(timeout=30) as client:
         await client.post(url, json={"chat_id": chat_id, "text": text})
@@ -305,7 +309,7 @@ def pick_subfolder_name(caption_or_text: str, filename: str = "", mime_type: str
             return folder
 
     # 3) defaults:
-    if mime_type.startswith("image/"):
+    if (mime_type or "").startswith("image/"):
         return "08_Фото_от_клиента"
     return "05_Макеты_и_векторы"
 
@@ -353,6 +357,7 @@ def health():
     return {"ok": True, "year": YEAR_FIXED}
 
 
+# ✅ ВАЖНО: webhook отвечает мгновенно, обработка идет в фоне
 @app.post("/telegram/webhook")
 async def telegram_webhook(req: Request):
     # Security header (optional)
@@ -362,229 +367,262 @@ async def telegram_webhook(req: Request):
             return {"ok": False, "error": "bad secret token"}
 
     update = await req.json()
+
+    # не блокируем Telegram
+    asyncio.create_task(process_update(update))
+    return {"ok": True}
+
+
+async def process_update(update: dict):
     msg = update.get("message") or {}
     chat = msg.get("chat") or {}
     chat_id = chat.get("id")
     if not chat_id:
-        return {"ok": True}
+        return
 
-    text = (msg.get("text") or "").strip()
-    caption = (msg.get("caption") or "").strip()
+    try:
+        text = (msg.get("text") or "").strip()
+        caption = (msg.get("caption") or "").strip()
 
-    # -------------------------
-    # Commands
-    # -------------------------
-    if text.lower() in ["/start", "start", "/help", "help"]:
+        # -------------------------
+        # Commands
+        # -------------------------
+        if text.lower() in ["/start", "start", "/help", "help"]:
+            await tg_send_message(
+                chat_id,
+                "Я Brandcomm Assistant.\n\n"
+                "1) Создай сделку:\n"
+                "   Клиент: РЖД; Сделка: куртки 300\n\n"
+                "2) Потом кидай файлы — я разложу по папкам.\n"
+                "   Можно с тегами: #kp #contract #invoice #design #photo #cost #cz\n"
+                "   Можно БЕЗ тегов — я попробую угадать по имени/типу.\n\n"
+                "Команды:\n"
+                "/where — покажу текущую сделку\n"
+                "/set_webhook — установить webhook\n"
+            )
+            return
+
+        if text.lower() == "/set_webhook":
+            try:
+                res = await tg_set_webhook()
+                await tg_send_message(chat_id, f"Webhook установлен ✅\n{res}")
+            except Exception as e:
+                await tg_send_message(chat_id, f"Ошибка setWebhook: {e}")
+            return
+
+        if text.lower() == "/where":
+            ctx = CHAT_CONTEXT.get(chat_id)
+            if not ctx:
+                await tg_send_message(chat_id, "Контекст сделки не выбран. Отправь: Клиент: ...; Сделка: ...")
+            else:
+                await tg_send_message(
+                    chat_id,
+                    "Текущая сделка ✅\n"
+                    f"Год: {YEAR_FIXED}\n"
+                    f"Клиент: {ctx.get('client')}\n"
+                    f"Сделка: {ctx.get('deal')}\n"
+                    f"Папка: {ctx.get('deal_url')}"
+                )
+            return
+
+        # -------------------------
+        # Create deal by text
+        # -------------------------
+        if "клиент" in text.lower() and "сделка" in text.lower():
+            try:
+                client_name, deal_name = parse_request(text)
+
+                # Drive папки — синхронные операции -> в thread
+                folders = await anyio.to_thread.run_sync(build_deal_folders, client_name, deal_name)
+
+                deal_folder = folders["deal_folder"]
+                deal_url = deal_folder.get("webViewLink", "")
+                deal_id = deal_folder.get("id", "")
+
+                at = await airtable_create_deal(client_name, deal_name, deal_url, deal_id)
+
+                CHAT_CONTEXT[chat_id] = {
+                    "client": client_name,
+                    "deal": deal_name,
+                    "deal_id": deal_id,
+                    "deal_url": deal_url,
+                    "subfolders": {k: v.get("id") for k, v in folders["subfolders"].items()},
+                }
+
+                await tg_send_message(
+                    chat_id,
+                    "Сделка создана ✅\n"
+                    f"Год: {YEAR_FIXED}\n"
+                    f"Клиент: {client_name}\n"
+                    f"Сделка: {deal_name}\n"
+                    f"Папка: {deal_url}\n"
+                    f"Airtable record: {at.get('id')}\n\n"
+                    "Теперь отправляй файлы — я разложу по папкам."
+                )
+            except Exception as e:
+                await tg_send_message(chat_id, f"Ошибка: {e}")
+            return
+
+        # -------------------------
+        # Files handling
+        # -------------------------
+        has_document = msg.get("document") is not None
+        has_photo = msg.get("photo") is not None
+        has_video = msg.get("video") is not None
+        has_audio = msg.get("audio") is not None
+        has_voice = msg.get("voice") is not None
+
+        if has_document or has_photo or has_video or has_audio or has_voice:
+            ctx = CHAT_CONTEXT.get(chat_id)
+            if not ctx:
+                await tg_send_message(chat_id, "Сначала выбери сделку: Клиент: ...; Сделка: ... (иначе не знаю куда класть файлы)")
+                return
+
+            try:
+                # _drive_service() — синхронная -> в thread
+                service = await anyio.to_thread.run_sync(_drive_service)
+
+                sub_map = ctx.get("subfolders", {})
+                deal_id = ctx["deal_id"]
+
+                # ---- document
+                if has_document:
+                    doc = msg["document"]
+                    file_id = doc["file_id"]
+                    filename = doc.get("file_name") or "file"
+                    mime = doc.get("mime_type") or ""
+                    target_name = pick_subfolder_name(caption, filename=filename, mime_type=mime)
+                    target_folder_id = sub_map.get(target_name) or deal_id
+
+                    file_path = await tg_get_file_path(file_id)
+                    local_path = await tg_download_to_tmp(file_path)
+
+                    uploaded = await anyio.to_thread.run_sync(
+                        drive_upload_file, service, local_path, filename, target_folder_id
+                    )
+
+                    await tg_send_message(
+                        chat_id,
+                        "Файл загружен ✅\n"
+                        f"Куда: {target_name}\n"
+                        f"Drive: {uploaded.get('webViewLink')}"
+                    )
+                    return
+
+                # ---- photo (biggest)
+                if has_photo:
+                    photos = msg["photo"]
+                    biggest = photos[-1]
+                    file_id = biggest["file_id"]
+                    filename = "photo.jpg"
+                    mime = "image/jpeg"
+                    target_name = pick_subfolder_name(caption, filename=filename, mime_type=mime)
+                    target_folder_id = sub_map.get(target_name) or deal_id
+
+                    file_path = await tg_get_file_path(file_id)
+                    local_path = await tg_download_to_tmp(file_path)
+
+                    uploaded = await anyio.to_thread.run_sync(
+                        drive_upload_file, service, local_path, local_path.name, target_folder_id
+                    )
+
+                    await tg_send_message(
+                        chat_id,
+                        "Фото загружено ✅\n"
+                        f"Куда: {target_name}\n"
+                        f"Drive: {uploaded.get('webViewLink')}"
+                    )
+                    return
+
+                # ---- video
+                if has_video:
+                    vid = msg["video"]
+                    file_id = vid["file_id"]
+                    filename = vid.get("file_name") or "video.mp4"
+                    mime = vid.get("mime_type") or "video/mp4"
+                    target_name = pick_subfolder_name(caption, filename=filename, mime_type=mime)
+                    target_folder_id = sub_map.get(target_name) or deal_id
+
+                    file_path = await tg_get_file_path(file_id)
+                    local_path = await tg_download_to_tmp(file_path)
+
+                    uploaded = await anyio.to_thread.run_sync(
+                        drive_upload_file, service, local_path, local_path.name, target_folder_id
+                    )
+
+                    await tg_send_message(
+                        chat_id,
+                        "Видео загружено ✅\n"
+                        f"Куда: {target_name}\n"
+                        f"Drive: {uploaded.get('webViewLink')}"
+                    )
+                    return
+
+                # ---- audio
+                if has_audio:
+                    aud = msg["audio"]
+                    file_id = aud["file_id"]
+                    filename = aud.get("file_name") or "audio.mp3"
+                    mime = aud.get("mime_type") or "audio/mpeg"
+                    target_name = pick_subfolder_name(caption, filename=filename, mime_type=mime)
+                    target_folder_id = sub_map.get(target_name) or deal_id
+
+                    file_path = await tg_get_file_path(file_id)
+                    local_path = await tg_download_to_tmp(file_path)
+
+                    uploaded = await anyio.to_thread.run_sync(
+                        drive_upload_file, service, local_path, filename, target_folder_id
+                    )
+
+                    await tg_send_message(
+                        chat_id,
+                        "Аудио загружено ✅\n"
+                        f"Куда: {target_name}\n"
+                        f"Drive: {uploaded.get('webViewLink')}"
+                    )
+                    return
+
+                # ---- voice
+                if has_voice:
+                    v = msg["voice"]
+                    file_id = v["file_id"]
+                    filename = "voice.ogg"
+                    mime = v.get("mime_type") or "audio/ogg"
+                    target_name = pick_subfolder_name(caption, filename=filename, mime_type=mime)
+                    target_folder_id = sub_map.get(target_name) or deal_id
+
+                    file_path = await tg_get_file_path(file_id)
+                    local_path = await tg_download_to_tmp(file_path)
+
+                    uploaded = await anyio.to_thread.run_sync(
+                        drive_upload_file, service, local_path, filename, target_folder_id
+                    )
+
+                    await tg_send_message(
+                        chat_id,
+                        "Voice загружен ✅\n"
+                        f"Куда: {target_name}\n"
+                        f"Drive: {uploaded.get('webViewLink')}"
+                    )
+                    return
+
+            except Exception as e:
+                await tg_send_message(chat_id, f"Ошибка загрузки файла: {e}")
+                return
+
+        # -------------------------
+        # Fallback
+        # -------------------------
         await tg_send_message(
             chat_id,
-            "Я Brandcomm Assistant.\n\n"
-            "1) Создай сделку:\n"
-            "   Клиент: РЖД; Сделка: куртки 300\n\n"
-            "2) Потом кидай файлы — я разложу по папкам.\n"
-            "   Можно с тегами: #kp #contract #invoice #design #photo #cost #cz\n"
-            "   Можно БЕЗ тегов — я попробую угадать по имени/типу.\n\n"
-            "Команды:\n"
-            "/where — покажу текущую сделку\n"
-            "/set_webhook — установить webhook\n"
+            "Не вижу команды.\n"
+            "Создай сделку: Клиент: ...; Сделка: ...\n"
+            "или отправь файл (можно с тегом #kp #contract #invoice #design #photo …)."
         )
-        return {"ok": True}
 
-    if text.lower() == "/set_webhook":
+    except Exception as e:
+        # Чтобы task не падал молча
         try:
-            res = await tg_set_webhook()
-            await tg_send_message(chat_id, f"Webhook установлен ✅\n{res}")
-        except Exception as e:
-            await tg_send_message(chat_id, f"Ошибка setWebhook: {e}")
-        return {"ok": True}
-
-    if text.lower() == "/where":
-        ctx = CHAT_CONTEXT.get(chat_id)
-        if not ctx:
-            await tg_send_message(chat_id, "Контекст сделки не выбран. Отправь: Клиент: ...; Сделка: ...")
-        else:
-            await tg_send_message(
-                chat_id,
-                "Текущая сделка ✅\n"
-                f"Год: {YEAR_FIXED}\n"
-                f"Клиент: {ctx.get('client')}\n"
-                f"Сделка: {ctx.get('deal')}\n"
-                f"Папка: {ctx.get('deal_url')}"
-            )
-        return {"ok": True}
-
-    # -------------------------
-    # Create deal by text
-    # -------------------------
-    if "клиент" in text.lower() and "сделка" in text.lower():
-        try:
-            client_name, deal_name = parse_request(text)
-            folders = build_deal_folders(client_name, deal_name)
-
-            deal_folder = folders["deal_folder"]
-            deal_url = deal_folder.get("webViewLink", "")
-            deal_id = deal_folder.get("id", "")
-
-            at = await airtable_create_deal(client_name, deal_name, deal_url, deal_id)
-
-            CHAT_CONTEXT[chat_id] = {
-                "client": client_name,
-                "deal": deal_name,
-                "deal_id": deal_id,
-                "deal_url": deal_url,
-                "subfolders": {k: v.get("id") for k, v in folders["subfolders"].items()},
-            }
-
-            await tg_send_message(
-                chat_id,
-                "Сделка создана ✅\n"
-                f"Год: {YEAR_FIXED}\n"
-                f"Клиент: {client_name}\n"
-                f"Сделка: {deal_name}\n"
-                f"Папка: {deal_url}\n"
-                f"Airtable record: {at.get('id')}\n\n"
-                "Теперь отправляй файлы — я разложу по папкам."
-            )
-        except Exception as e:
-            await tg_send_message(chat_id, f"Ошибка: {e}")
-        return {"ok": True}
-
-    # -------------------------
-    # Files handling
-    # -------------------------
-    has_document = msg.get("document") is not None
-    has_photo = msg.get("photo") is not None
-    has_video = msg.get("video") is not None
-    has_audio = msg.get("audio") is not None
-    has_voice = msg.get("voice") is not None
-
-    if has_document or has_photo or has_video or has_audio or has_voice:
-        ctx = CHAT_CONTEXT.get(chat_id)
-        if not ctx:
-            await tg_send_message(chat_id, "Сначала выбери сделку: Клиент: ...; Сделка: ... (иначе не знаю куда класть файлы)")
-            return {"ok": True}
-
-        try:
-            service = _drive_service()
-            sub_map = ctx.get("subfolders", {})
-            deal_id = ctx["deal_id"]
-
-            # ---- document
-            if has_document:
-                doc = msg["document"]
-                file_id = doc["file_id"]
-                filename = doc.get("file_name") or "file"
-                mime = doc.get("mime_type") or ""
-                target_name = pick_subfolder_name(caption, filename=filename, mime_type=mime)
-                target_folder_id = sub_map.get(target_name) or deal_id
-
-                file_path = await tg_get_file_path(file_id)
-                local_path = await tg_download_to_tmp(file_path)
-                uploaded = drive_upload_file(service, local_path, filename, target_folder_id)
-
-                await tg_send_message(
-                    chat_id,
-                    "Файл загружен ✅\n"
-                    f"Куда: {target_name}\n"
-                    f"Drive: {uploaded.get('webViewLink')}"
-                )
-                return {"ok": True}
-
-            # ---- photo (biggest)
-            if has_photo:
-                photos = msg["photo"]
-                biggest = photos[-1]
-                file_id = biggest["file_id"]
-                filename = "photo.jpg"
-                mime = "image/jpeg"
-                target_name = pick_subfolder_name(caption, filename=filename, mime_type=mime)
-                target_folder_id = sub_map.get(target_name) or deal_id
-
-                file_path = await tg_get_file_path(file_id)
-                local_path = await tg_download_to_tmp(file_path)
-                uploaded = drive_upload_file(service, local_path, local_path.name, target_folder_id)
-
-                await tg_send_message(
-                    chat_id,
-                    "Фото загружено ✅\n"
-                    f"Куда: {target_name}\n"
-                    f"Drive: {uploaded.get('webViewLink')}"
-                )
-                return {"ok": True}
-
-            # ---- video
-            if has_video:
-                vid = msg["video"]
-                file_id = vid["file_id"]
-                filename = vid.get("file_name") or "video.mp4"
-                mime = vid.get("mime_type") or "video/mp4"
-                target_name = pick_subfolder_name(caption, filename=filename, mime_type=mime)
-                target_folder_id = sub_map.get(target_name) or deal_id
-
-                file_path = await tg_get_file_path(file_id)
-                local_path = await tg_download_to_tmp(file_path)
-                uploaded = drive_upload_file(service, local_path, local_path.name, target_folder_id)
-
-                await tg_send_message(
-                    chat_id,
-                    "Видео загружено ✅\n"
-                    f"Куда: {target_name}\n"
-                    f"Drive: {uploaded.get('webViewLink')}"
-                )
-                return {"ok": True}
-
-            # ---- audio
-            if has_audio:
-                aud = msg["audio"]
-                file_id = aud["file_id"]
-                filename = aud.get("file_name") or "audio.mp3"
-                mime = aud.get("mime_type") or "audio/mpeg"
-                target_name = pick_subfolder_name(caption, filename=filename, mime_type=mime)
-                target_folder_id = sub_map.get(target_name) or deal_id
-
-                file_path = await tg_get_file_path(file_id)
-                local_path = await tg_download_to_tmp(file_path)
-                uploaded = drive_upload_file(service, local_path, filename, target_folder_id)
-
-                await tg_send_message(
-                    chat_id,
-                    "Аудио загружено ✅\n"
-                    f"Куда: {target_name}\n"
-                    f"Drive: {uploaded.get('webViewLink')}"
-                )
-                return {"ok": True}
-
-            # ---- voice
-            if has_voice:
-                v = msg["voice"]
-                file_id = v["file_id"]
-                filename = "voice.ogg"
-                mime = v.get("mime_type") or "audio/ogg"
-                target_name = pick_subfolder_name(caption, filename=filename, mime_type=mime)
-                target_folder_id = sub_map.get(target_name) or deal_id
-
-                file_path = await tg_get_file_path(file_id)
-                local_path = await tg_download_to_tmp(file_path)
-                uploaded = drive_upload_file(service, local_path, filename, target_folder_id)
-
-                await tg_send_message(
-                    chat_id,
-                    "Voice загружен ✅\n"
-                    f"Куда: {target_name}\n"
-                    f"Drive: {uploaded.get('webViewLink')}"
-                )
-                return {"ok": True}
-
-        except Exception as e:
-            await tg_send_message(chat_id, f"Ошибка загрузки файла: {e}")
-            return {"ok": True}
-
-    # -------------------------
-    # Fallback
-    # -------------------------
-    await tg_send_message(
-        chat_id,
-        "Не вижу команды.\n"
-        "Создай сделку: Клиент: ...; Сделка: ...\n"
-        "или отправь файл (можно с тегом #kp #contract #invoice #design #photo …)."
-    )
-    return {"ok": True}
+            await tg_send_message(chat_id, f"Ошибка обработки: {e}")
+        except Exception:
+            pass
