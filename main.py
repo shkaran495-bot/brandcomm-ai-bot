@@ -8,7 +8,7 @@ from pathlib import Path
 
 import anyio
 import httpx
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Header
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 
@@ -105,10 +105,13 @@ def _drive_service():
 
 
 # =========================
-# Остальной код (твой, без изменений логики)
+# Utils
 # =========================
 
 async def tg_send_message(chat_id: int, text: str):
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is missing")
+
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     async with httpx.AsyncClient(timeout=30) as client:
         await client.post(url, json={"chat_id": chat_id, "text": text})
@@ -161,6 +164,52 @@ def drive_upload_file(service, local_path: Path, filename: str, parent_folder_id
         supportsAllDrives=True,
     ).execute()
 
+
+# =========================
+# Webhook (ВАЖНОЕ)
+# =========================
+
+@app.post("/telegram/webhook")
+async def telegram_webhook(
+    request: Request,
+    x_telegram_bot_api_secret_token: Optional[str] = Header(default=None),
+):
+    # 1) Проверяем secret_token, если он задан в ENV
+    if TELEGRAM_SECRET_TOKEN:
+        if (x_telegram_bot_api_secret_token or "") != TELEGRAM_SECRET_TOKEN:
+            # Возвращаем 200, но ничего не делаем — защита от чужих запросов
+            return {"ok": True}
+
+    # 2) Получаем update от Telegram
+    update = await request.json()
+
+    # 3) Мини-обработчик: отвечаем пользователю, чтобы увидеть что всё работает
+    try:
+        message = update.get("message") or {}
+        chat = message.get("chat") or {}
+        chat_id = chat.get("id")
+
+        text = (message.get("text") or "").strip()
+
+        if chat_id:
+            if text == "/start":
+                await tg_send_message(
+                    chat_id,
+                    "✅ Webhook работает. Напиши: 'Клиент: РЖД; Сделка: куртки 300' — и я отвечу эхо (пока без Drive/Airtable).",
+                )
+            elif text:
+                await tg_send_message(chat_id, f"✅ Принял: {text}")
+    except Exception as e:
+        # В логах Render будет видно, если что-то упало
+        print("Webhook handler error:", repr(e))
+
+    # 4) Telegramу важно получить 200 OK
+    return {"ok": True}
+
+
+# =========================
+# Health / Root
+# =========================
 
 @app.get("/health")
 def health():
