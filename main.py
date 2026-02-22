@@ -4,6 +4,7 @@ import base64
 import re
 from datetime import datetime
 from typing import Optional
+from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, Request
@@ -11,6 +12,7 @@ from pydantic import BaseModel
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
 
 
 # -------------------------
@@ -31,6 +33,10 @@ GOOGLE_SA_JSON_B64 = os.getenv("GOOGLE_SA_JSON_B64", "").strip()
 
 # Webhook URL (Render даст после деплоя). Нужен чтобы поставить webhook.
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip()  # например https://brandcomm-ai-bot.onrender.com
+
+
+# chat_id -> {"deal_id": "...", "deal_url": "...", "subfolders": {...}, "client": "...", "deal": "..."}
+CHAT_CONTEXT: dict[int, dict] = {}
 
 
 # -------------------------
@@ -57,6 +63,27 @@ async def tg_set_webhook():
         r = await client.post(url, json=payload)
         r.raise_for_status()
         return r.json()
+
+
+async def tg_get_file_path(file_id: str) -> str:
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getFile"
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.get(url, params={"file_id": file_id})
+        r.raise_for_status()
+        data = r.json()
+        if not data.get("ok"):
+            raise RuntimeError(f"Telegram getFile not ok: {data}")
+        return data["result"]["file_path"]
+
+
+async def tg_download_to_tmp(file_path: str) -> Path:
+    dl_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
+    tmp_path = Path("/tmp") / Path(file_path).name  # Render: писать можно в /tmp
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.get(dl_url)
+        r.raise_for_status()
+        tmp_path.write_bytes(r.content)
+    return tmp_path
 
 
 # -------------------------
@@ -88,7 +115,6 @@ async def airtable_create_deal(client_name: str, deal_name: str, drive_folder_ur
     }
 
     async with httpx.AsyncClient(timeout=30) as client:
-        # Airtable принимает создание одиночной записи через {"fields": {...}}
         r = await client.post(url, headers=headers, json={"fields": fields})
         if r.status_code >= 400:
             raise RuntimeError(f"Airtable error {r.status_code}: {r.text}")
@@ -103,7 +129,18 @@ def _drive_service():
         raise RuntimeError("Google Drive env vars missing")
 
     clean_b64 = GOOGLE_SA_JSON_B64.strip()
-    sa_info = json.loads(base64.b64decode(clean_b64).decode("utf-8"))
+
+    # иногда люди случайно вставляют JSON напрямую — подстрахуемся:
+    if clean_b64.startswith("{") and clean_b64.endswith("}"):
+        sa_info = json.loads(clean_b64)
+    else:
+        # подстраховка от переносов строк/пробелов
+        clean_b64 = re.sub(r"\s+", "", clean_b64)
+        # если не кратно 4 — добавим '='
+        pad = (-len(clean_b64)) % 4
+        if pad:
+            clean_b64 += "=" * pad
+        sa_info = json.loads(base64.b64decode(clean_b64).decode("utf-8"))
 
     creds = service_account.Credentials.from_service_account_info(
         sa_info,
@@ -114,10 +151,7 @@ def _drive_service():
 
 def safe_name(s: str) -> str:
     """
-    Google Drive запрещает только '/', но мы чистим:
-    - '/' -> '_'
-    - лишние пробелы
-    - слишком длинные имена
+    Google Drive запрещает '/', заменяем на '_', чистим пробелы, ограничиваем длину.
     """
     s = (s or "").strip().replace("/", "_")
     s = re.sub(r"\s+", " ", s)
@@ -125,9 +159,6 @@ def safe_name(s: str) -> str:
 
 
 def drive_find_folder(service, name: str, parent_id: str) -> Optional[str]:
-    """
-    Ищет папку по имени в конкретном parent_id.
-    """
     name = name.replace("'", "\\'")
     q = (
         "mimeType='application/vnd.google-apps.folder' and "
@@ -141,9 +172,6 @@ def drive_find_folder(service, name: str, parent_id: str) -> Optional[str]:
 
 
 def drive_get_or_create_folder(service, name: str, parent_id: str) -> dict:
-    """
-    Не плодит дубликаты: если папка есть — возвращает её, иначе создаёт.
-    """
     name = safe_name(name)
     existing_id = drive_find_folder(service, name, parent_id)
     if existing_id:
@@ -158,9 +186,20 @@ def drive_get_or_create_folder(service, name: str, parent_id: str) -> dict:
     return folder
 
 
+def drive_upload_file(service, local_path: Path, filename: str, parent_folder_id: str) -> dict:
+    file_metadata = {"name": filename, "parents": [parent_folder_id]}
+    media = MediaFileUpload(str(local_path), resumable=False)
+    uploaded = service.files().create(
+        body=file_metadata,
+        media_body=media,
+        fields="id, name, webViewLink"
+    ).execute()
+    return uploaded
+
+
 def build_deal_folders(client_name: str, deal_name: str) -> dict:
     """
-    Создаёт структуру (как ты просил):
+    Создаёт структуру:
     BrandcommRoot/
       2026/
         <Клиент>/
@@ -176,13 +215,13 @@ def build_deal_folders(client_name: str, deal_name: str) -> dict:
     """
     service = _drive_service()
 
-    year = str(datetime.now().year)                 # "2026"
-    date_str = datetime.now().strftime("%Y-%m-%d")  # "2026-02-22"
+    year = "2026"  # всегда
+    date_str = datetime.now().strftime("%Y-%m-%d")
 
     client_name = safe_name(client_name or "Client")
     deal_name = safe_name(deal_name or "Deal")
 
-    # / BrandcommRoot / 2026
+    # / BrandcommRoot / 2026 (не создаём заново каждый раз, используем get_or_create)
     year_folder = drive_get_or_create_folder(service, year, GDRIVE_ROOT_FOLDER_ID)
 
     # / 2026 / <Клиент>
@@ -192,7 +231,6 @@ def build_deal_folders(client_name: str, deal_name: str) -> dict:
     deal_folder_name = f"{deal_name}_{date_str}"
     deal_folder = drive_get_or_create_folder(service, deal_folder_name, client_folder["id"])
 
-    # сабпапки внутри сделки
     subfolder_names = [
         "01_КП_для клиента",
         "02_Себестоимость",
@@ -214,6 +252,26 @@ def build_deal_folders(client_name: str, deal_name: str) -> dict:
         "deal_folder": deal_folder,
         "subfolders": subfolders,
     }
+
+
+TAG_TO_FOLDER = {
+    "#kp": "01_КП_для клиента",
+    "#cost": "02_Себестоимость",
+    "#contract": "03_Договор_и_приложение",
+    "#invoice": "04_Счета_и_закрывашки",
+    "#design": "05_Макеты_и_векторы",
+    "#close": "06_Закрывашки",
+    "#cz": "07_Честный_знак",
+    "#photo": "08_Фото_от_клиента",
+}
+
+
+def pick_subfolder_name(caption_or_text: str) -> Optional[str]:
+    t = (caption_or_text or "").lower()
+    for tag, folder in TAG_TO_FOLDER.items():
+        if tag in t:
+            return folder
+    return None
 
 
 # -------------------------
@@ -265,7 +323,6 @@ def health():
 
 @app.post("/telegram/webhook")
 async def telegram_webhook(req: Request):
-    # Optional security: verify Telegram secret token header if you set it
     if TELEGRAM_SECRET_TOKEN:
         got = req.headers.get("x-telegram-bot-api-secret-token", "")
         if got != TELEGRAM_SECRET_TOKEN:
@@ -275,49 +332,149 @@ async def telegram_webhook(req: Request):
     msg = update.get("message") or {}
     chat = msg.get("chat") or {}
     chat_id = chat.get("id")
-    text = msg.get("text") or ""
 
     if not chat_id:
         return {"ok": True}
 
-    # commands
-    if text.strip().lower() in ["/start", "start"]:
+    text = (msg.get("text") or "").strip()
+    caption = (msg.get("caption") or "").strip()
+
+    # /start
+    if text.lower() in ["/start", "start"]:
         await tg_send_message(
             chat_id,
             "Я Brandcomm Assistant.\n"
-            "Напиши: Клиент: РЖД; Сделка: куртки 300 — и я создам структуру папок + запись в Airtable."
+            "1) Создай сделку: Клиент: РЖД; Сделка: куртки 300\n"
+            "2) Потом кидай файлы с тегами: #kp #contract #invoice #design #photo и т.д.\n"
+            "Команда: /where — покажу текущую сделку."
         )
         return {"ok": True}
 
-    if text.strip().lower() == "/set_webhook":
+    # показать текущую сделку
+    if text.lower() == "/where":
+        ctx = CHAT_CONTEXT.get(chat_id)
+        if not ctx:
+            await tg_send_message(chat_id, "Контекст сделки не выбран. Сначала отправь: Клиент: ...; Сделка: ...")
+        else:
+            await tg_send_message(
+                chat_id,
+                "Текущая сделка ✅\n"
+                f"Клиент: {ctx.get('client')}\n"
+                f"Сделка: {ctx.get('deal')}\n"
+                f"Папка: {ctx.get('deal_url')}"
+            )
+        return {"ok": True}
+
+    # создать сделку по тексту
+    if "клиент" in text.lower() and "сделка" in text.lower():
         try:
-            res = await tg_set_webhook()
-            await tg_send_message(chat_id, f"Webhook установлен ✅\n{res}")
+            client_name, deal_name = parse_request(text)
+            folders = build_deal_folders(client_name, deal_name)
+
+            deal_folder = folders["deal_folder"]
+            deal_url = deal_folder.get("webViewLink", "")
+            deal_id = deal_folder.get("id", "")
+
+            at = await airtable_create_deal(client_name, deal_name, deal_url, deal_id)
+
+            # сохраняем контекст в память
+            CHAT_CONTEXT[chat_id] = {
+                "client": client_name,
+                "deal": deal_name,
+                "deal_id": deal_id,
+                "deal_url": deal_url,
+                "subfolders": {k: v.get("id") for k, v in folders["subfolders"].items()},
+            }
+
+            await tg_send_message(
+                chat_id,
+                "Готово ✅\n"
+                f"Клиент: {client_name}\n"
+                f"Сделка: {deal_name}\n"
+                f"Папка: {deal_url}\n"
+                f"Airtable record: {at.get('id')}\n\n"
+                "Теперь отправляй файлы с тегами (#kp #contract #invoice #design #photo …) — я разложу по папкам."
+            )
         except Exception as e:
-            await tg_send_message(chat_id, f"Ошибка setWebhook: {e}")
+            await tg_send_message(chat_id, f"Ошибка: {e}")
         return {"ok": True}
 
-    # Main flow: create deal + folders + airtable
-    try:
-        client_name, deal_name = parse_request(text)
+    # обработка файлов (document / photo / video)
+    has_document = msg.get("document") is not None
+    has_photo = msg.get("photo") is not None
+    has_video = msg.get("video") is not None
 
-        folders = build_deal_folders(client_name, deal_name)
-        deal_folder = folders["deal_folder"]
-        deal_url = deal_folder.get("webViewLink", "")
-        deal_id = deal_folder.get("id", "")
+    if has_document or has_photo or has_video:
+        ctx = CHAT_CONTEXT.get(chat_id)
+        if not ctx:
+            await tg_send_message(chat_id, "Сначала выбери сделку: Клиент: ...; Сделка: ... (иначе не знаю куда класть файлы)")
+            return {"ok": True}
 
-        # Airtable record
-        at = await airtable_create_deal(client_name, deal_name, deal_url, deal_id)
+        try:
+            service = _drive_service()
 
-        await tg_send_message(
-            chat_id,
-            "Готово ✅\n"
-            f"Клиент: {client_name}\n"
-            f"Сделка: {deal_name}\n"
-            f"Папка: {deal_url}\n"
-            f"Airtable record: {at.get('id')}"
-        )
-    except Exception as e:
-        await tg_send_message(chat_id, f"Ошибка: {e}")
+            target_name = pick_subfolder_name(caption) or "05_Макеты_и_векторы"
+            sub_map = ctx.get("subfolders", {})
+            target_folder_id = sub_map.get(target_name) or ctx["deal_id"]
 
+            # Document
+            if has_document:
+                doc = msg["document"]
+                file_id = doc["file_id"]
+                filename = doc.get("file_name") or "file"
+                file_path = await tg_get_file_path(file_id)
+                local_path = await tg_download_to_tmp(file_path)
+                uploaded = drive_upload_file(service, local_path, filename, target_folder_id)
+                await tg_send_message(
+                    chat_id,
+                    f"Файл загружен ✅\n"
+                    f"Куда: {target_name}\n"
+                    f"Drive: {uploaded.get('webViewLink')}"
+                )
+                return {"ok": True}
+
+            # Photo (самое большое)
+            if has_photo:
+                photos = msg["photo"]
+                biggest = photos[-1]
+                file_id = biggest["file_id"]
+                file_path = await tg_get_file_path(file_id)
+                local_path = await tg_download_to_tmp(file_path)
+                filename = local_path.name
+                uploaded = drive_upload_file(service, local_path, filename, target_folder_id)
+                await tg_send_message(
+                    chat_id,
+                    f"Фото загружено ✅\n"
+                    f"Куда: {target_name}\n"
+                    f"Drive: {uploaded.get('webViewLink')}"
+                )
+                return {"ok": True}
+
+            # Video
+            if has_video:
+                vid = msg["video"]
+                file_id = vid["file_id"]
+                file_path = await tg_get_file_path(file_id)
+                local_path = await tg_download_to_tmp(file_path)
+                filename = local_path.name
+                uploaded = drive_upload_file(service, local_path, filename, target_folder_id)
+                await tg_send_message(
+                    chat_id,
+                    f"Видео загружено ✅\n"
+                    f"Куда: {target_name}\n"
+                    f"Drive: {uploaded.get('webViewLink')}"
+                )
+                return {"ok": True}
+
+        except Exception as e:
+            await tg_send_message(chat_id, f"Ошибка загрузки файла: {e}")
+            return {"ok": True}
+
+    # если просто текст без команды
+    await tg_send_message(
+        chat_id,
+        "Не вижу команды.\n"
+        "Создай сделку: Клиент: ...; Сделка: ...\n"
+        "или отправь файл с тегом (#kp #contract #invoice #design #photo …)."
+    )
     return {"ok": True}
