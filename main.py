@@ -91,6 +91,10 @@ async def airtable_create_deal(client_name: str, deal_name: str, drive_folder_ur
 
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.post(url, headers=headers, json={"fields": fields})
+
+        if r.status_code >= 400:
+            raise RuntimeError(f"Airtable error {r.status_code}: {r.text}")
+
         r.raise_for_status()
         return r.json()
 
