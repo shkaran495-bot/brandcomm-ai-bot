@@ -1,11 +1,13 @@
 import os
 import re
+from datetime import datetime
 from typing import Optional
 from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, Request, Header
 from fastapi.responses import RedirectResponse
+from pydantic import BaseModel
 
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
@@ -19,6 +21,10 @@ from googleapiclient.http import MediaFileUpload
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_SECRET_TOKEN = os.getenv("TELEGRAM_SECRET_TOKEN", "").strip()
 
+AIRTABLE_API_KEY = os.getenv("AIRTABLE_API_KEY", "").strip()
+AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID", "").strip()
+AIRTABLE_TABLE_DEALS = os.getenv("AIRTABLE_TABLE_DEALS", "Deals").strip()
+
 GDRIVE_ROOT_FOLDER_ID = os.getenv("GDRIVE_ROOT_FOLDER_ID", "").strip()
 
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "").strip()
@@ -27,6 +33,8 @@ GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", "").strip()
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 YEAR_FIXED = "2026"
+
+CHAT_CONTEXT: dict[int, dict] = {}
 
 app = FastAPI()
 
@@ -48,13 +56,8 @@ def auth():
         },
         scopes=SCOPES,
     )
-
     flow.redirect_uri = GOOGLE_REDIRECT_URI
-    authorization_url, _ = flow.authorization_url(
-        access_type="offline",
-        prompt="consent",
-    )
-
+    authorization_url, _ = flow.authorization_url(access_type="offline", prompt="consent")
     return RedirectResponse(authorization_url)
 
 
@@ -72,7 +75,6 @@ async def oauth2callback(request: Request):
         },
         scopes=SCOPES,
     )
-
     flow.redirect_uri = GOOGLE_REDIRECT_URI
     flow.fetch_token(authorization_response=str(request.url))
     creds = flow.credentials
@@ -135,68 +137,117 @@ def drive_get_or_create_folder(service, name: str, parent_id: str):
         supportsAllDrives=True,
     ).execute()
 
+
+def drive_upload_file(service, local_path: Path, filename: str, parent_folder_id: str):
+    media = MediaFileUpload(str(local_path), resumable=False)
+    return service.files().create(
+        body={"name": filename, "parents": [parent_folder_id]},
+        media_body=media,
+        fields="id,name,webViewLink",
+        supportsAllDrives=True,
+    ).execute()
+
+# =========================
+# Deal structure
+# =========================
+
+def build_deal_structure(service, client_name, deal_name):
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    deal_folder_name = f"{deal_name}_{date_str}"
+
+    year_folder = drive_get_or_create_folder(service, YEAR_FIXED, GDRIVE_ROOT_FOLDER_ID)
+    client_folder = drive_get_or_create_folder(service, client_name, year_folder["id"])
+    deal_folder = drive_get_or_create_folder(service, deal_folder_name, client_folder["id"])
+
+    subfolders = [
+        "01_КП_для клиента",
+        "02_Себестоимость",
+        "03_Договор_и_приложение",
+        "04_Счета_и_закрывашки",
+        "05_Макеты_и_векторы",
+        "06_Закрывашки",
+        "07_Честный_знак",
+        "08_Фото_от_клиента",
+    ]
+
+    sub_map = {}
+    for sf in subfolders:
+        folder = drive_get_or_create_folder(service, sf, deal_folder["id"])
+        sub_map[sf] = folder["id"]
+
+    return deal_folder, sub_map
+
 # =========================
 # Webhook
 # =========================
 
 @app.post("/telegram/webhook")
-async def telegram_webhook(
-    request: Request,
-    x_telegram_bot_api_secret_token: Optional[str] = Header(default=None),
-):
-    if TELEGRAM_SECRET_TOKEN:
-        if (x_telegram_bot_api_secret_token or "") != TELEGRAM_SECRET_TOKEN:
-            return {"ok": True}
-
+async def telegram_webhook(request: Request):
     update = await request.json()
+    msg = update.get("message") or {}
+    chat_id = msg.get("chat", {}).get("id")
+    text = (msg.get("text") or "").strip()
 
-    try:
-        message = update.get("message") or {}
-        chat = message.get("chat") or {}
-        chat_id = chat.get("id")
-        text = (message.get("text") or "").strip()
+    if not chat_id:
+        return {"ok": True}
 
-        if not chat_id or not text:
-            return {"ok": True}
-
-        if text == "/start":
-            await tg_send_message(chat_id, "Отправь: Клиент: РЖД; Сделка: куртки 300")
-            return {"ok": True}
-
-        match = re.search(r"Клиент:\s*(.+?);\s*Сделка:\s*(.+)", text)
-        if not match:
+    if "клиент" in text.lower() and "сделка" in text.lower():
+        service = _drive_service()
+        m = re.search(r"Клиент:\s*(.+?);\s*Сделка:\s*(.+)", text)
+        if not m:
             await tg_send_message(chat_id, "Формат: Клиент: XXX; Сделка: YYY")
             return {"ok": True}
 
-        client_name = safe_name(match.group(1))
-        deal_name = safe_name(match.group(2))
+        client = safe_name(m.group(1))
+        deal = safe_name(m.group(2))
+
+        deal_folder, sub_map = build_deal_structure(service, client, deal)
+
+        CHAT_CONTEXT[chat_id] = {
+            "deal_id": deal_folder["id"],
+            "subfolders": sub_map,
+        }
+
+        await tg_send_message(chat_id, f"Сделка создана ✅\n{deal_folder['webViewLink']}")
+        return {"ok": True}
+
+    # FILES
+    if msg.get("document"):
+        ctx = CHAT_CONTEXT.get(chat_id)
+        if not ctx:
+            await tg_send_message(chat_id, "Сначала создай сделку.")
+            return {"ok": True}
 
         service = _drive_service()
+        doc = msg["document"]
+        file_id = doc["file_id"]
+        file_name = doc.get("file_name") or "file"
 
-        year_folder = drive_get_or_create_folder(service, YEAR_FIXED, GDRIVE_ROOT_FOLDER_ID)
-        client_folder = drive_get_or_create_folder(service, client_name, year_folder["id"])
-        deal_folder = drive_get_or_create_folder(service, deal_name, client_folder["id"])
+        # simple default
+        target_folder_id = ctx["deal_id"]
 
-        await tg_send_message(
-            chat_id,
-            f"📁 Папка создана:\n{deal_folder.get('webViewLink')}"
+        # download
+        file_info = await httpx.AsyncClient().get(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getFile",
+            params={"file_id": file_id},
+        )
+        file_path = file_info.json()["result"]["file_path"]
+
+        file_content = await httpx.AsyncClient().get(
+            f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
         )
 
-    except Exception as e:
-        print("Drive error:", repr(e))
-        await tg_send_message(chat_id, "Ошибка Drive")
+        tmp = Path("/tmp") / file_name
+        tmp.write_bytes(file_content.content)
+
+        uploaded = drive_upload_file(service, tmp, file_name, target_folder_id)
+
+        await tg_send_message(chat_id, f"Файл загружен ✅\n{uploaded['webViewLink']}")
+        return {"ok": True}
 
     return {"ok": True}
 
-# =========================
-# Health
-# =========================
 
 @app.get("/health")
 def health():
     return {"ok": True}
-
-
-@app.get("/")
-def root():
-    return {"status": "Bot is running"}
