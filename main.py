@@ -16,20 +16,21 @@ from googleapiclient.discovery import build
 # -------------------------
 # ENV
 # -------------------------
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_SECRET_TOKEN = os.getenv("TELEGRAM_SECRET_TOKEN", "")  # optional
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_SECRET_TOKEN = os.getenv("TELEGRAM_SECRET_TOKEN", "").strip()  # optional
+
 AIRTABLE_API_KEY = os.getenv("AIRTABLE_API_KEY", "").strip()
 AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID", "").strip()
-AIRTABLE_TABLE_DEALS = os.getenv("AIRTABLE_TABLE_DEALS", "Deals")
+AIRTABLE_TABLE_DEALS = os.getenv("AIRTABLE_TABLE_DEALS", "Deals").strip()
 
 # ID корневой папки Brandcomm в Drive (папка, куда ты дал доступ service account)
-GDRIVE_ROOT_FOLDER_ID = os.getenv("GDRIVE_ROOT_FOLDER_ID", "")
+GDRIVE_ROOT_FOLDER_ID = os.getenv("GDRIVE_ROOT_FOLDER_ID", "").strip()
 
 # JSON сервисного аккаунта (base64) — безопасно хранить как env
 GOOGLE_SA_JSON_B64 = os.getenv("GOOGLE_SA_JSON_B64", "").strip()
 
 # Webhook URL (Render даст после деплоя). Нужен чтобы поставить webhook.
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")  # например https://brandcomm-ai-bot.onrender.com
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip()  # например https://brandcomm-ai-bot.onrender.com
 
 
 # -------------------------
@@ -44,10 +45,10 @@ async def tg_send_message(chat_id: int, text: str):
 async def tg_set_webhook():
     if not PUBLIC_BASE_URL:
         raise RuntimeError("PUBLIC_BASE_URL is empty")
+
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook"
-    payload = {
-        "url": f"{PUBLIC_BASE_URL}/telegram/webhook",
-    }
+    payload = {"url": f"{PUBLIC_BASE_URL}/telegram/webhook"}
+
     # optional secret token (Telegram will pass it in header X-Telegram-Bot-Api-Secret-Token)
     if TELEGRAM_SECRET_TOKEN:
         payload["secret_token"] = TELEGRAM_SECRET_TOKEN
@@ -64,13 +65,11 @@ async def tg_set_webhook():
 async def airtable_create_deal(client_name: str, deal_name: str, drive_folder_url: str, drive_folder_id: str):
     """
     Создаём запись в Airtable.
-    В таблице Deals должны быть поля (создадим позже, но лучше сразу):
-      - Client (single line text)
-      - DealName (single line text)
-      - Status (single select)  [optional]
+    В таблице Deals желательно поля:
+      - Client (text)
+      - DealName (text)
       - DriveFolderUrl (url)
-      - DriveFolderId (single line text)
-      - CreatedAt (date/time)   [optional]
+      - DriveFolderId (text)
     """
     if not (AIRTABLE_API_KEY and AIRTABLE_BASE_ID):
         raise RuntimeError("Airtable env vars missing")
@@ -80,22 +79,19 @@ async def airtable_create_deal(client_name: str, deal_name: str, drive_folder_ur
         "Authorization": f"Bearer {AIRTABLE_API_KEY}",
         "Content-Type": "application/json",
     }
-    now = datetime.utcnow().isoformat()
 
     fields = {
-    "Client": client_name,
-    "DealName": deal_name,
-    "DriveFolderUrl": drive_folder_url,
-    "DriveFolderId": drive_folder_id,
-}
+        "Client": client_name,
+        "DealName": deal_name,
+        "DriveFolderUrl": drive_folder_url,
+        "DriveFolderId": drive_folder_id,
+    }
 
     async with httpx.AsyncClient(timeout=30) as client:
+        # Airtable принимает создание одиночной записи через {"fields": {...}}
         r = await client.post(url, headers=headers, json={"fields": fields})
-
         if r.status_code >= 400:
             raise RuntimeError(f"Airtable error {r.status_code}: {r.text}")
-
-        r.raise_for_status()
         return r.json()
 
 
@@ -116,8 +112,43 @@ def _drive_service():
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 
-def drive_create_folder(name: str, parent_id: str) -> dict:
-    service = _drive_service()
+def safe_name(s: str) -> str:
+    """
+    Google Drive запрещает только '/', но мы чистим:
+    - '/' -> '_'
+    - лишние пробелы
+    - слишком длинные имена
+    """
+    s = (s or "").strip().replace("/", "_")
+    s = re.sub(r"\s+", " ", s)
+    return s[:120] if len(s) > 120 else s
+
+
+def drive_find_folder(service, name: str, parent_id: str) -> Optional[str]:
+    """
+    Ищет папку по имени в конкретном parent_id.
+    """
+    name = name.replace("'", "\\'")
+    q = (
+        "mimeType='application/vnd.google-apps.folder' and "
+        "trashed=false and "
+        f"'{parent_id}' in parents and "
+        f"name='{name}'"
+    )
+    res = service.files().list(q=q, fields="files(id,name)", pageSize=1).execute()
+    files = res.get("files", [])
+    return files[0]["id"] if files else None
+
+
+def drive_get_or_create_folder(service, name: str, parent_id: str) -> dict:
+    """
+    Не плодит дубликаты: если папка есть — возвращает её, иначе создаёт.
+    """
+    name = safe_name(name)
+    existing_id = drive_find_folder(service, name, parent_id)
+    if existing_id:
+        return {"id": existing_id, "name": name, "webViewLink": f"https://drive.google.com/drive/folders/{existing_id}"}
+
     file_metadata = {
         "name": name,
         "mimeType": "application/vnd.google-apps.folder",
@@ -127,56 +158,61 @@ def drive_create_folder(name: str, parent_id: str) -> dict:
     return folder
 
 
-def safe_name(s: str) -> str:
-    s = s.strip()
-    s = re.sub(r"[^\w\s\-\.\(\)\[\]]+", "", s, flags=re.UNICODE)
-    s = re.sub(r"\s+", " ", s)
-    return s[:80] if len(s) > 80 else s
-
-
 def build_deal_folders(client_name: str, deal_name: str) -> dict:
     """
-    Создаёт структуру:
+    Создаёт структуру (как ты просил):
     BrandcommRoot/
-      01_Deals/
-        Client/
-          2026/
-            Deal_YYYY-MM-DD_DealName/
-              01_Calc
-              02_KP
-              03_Contract
-              04_TZ
+      2026/
+        <Клиент>/
+          <Сделка>_<YYYY-MM-DD>/
+            01_КП_для клиента
+            02_Себестоимость
+            03_Договор_и_приложение
+            04_Счета_и_закрывашки
+            05_Макеты_и_векторы
+            06_Закрывашки
+            07_Честный_знак
+            08_Фото_от_клиента
     """
-    year = datetime.now().year
-    date_str = datetime.now().strftime("%Y-%m-%d")
+    service = _drive_service()
+
+    year = str(datetime.now().year)                 # "2026"
+    date_str = datetime.now().strftime("%Y-%m-%d")  # "2026-02-22"
 
     client_name = safe_name(client_name or "Client")
     deal_name = safe_name(deal_name or "Deal")
 
-    # 01_Deals
-    deals_root = drive_create_folder("01_Deals", GDRIVE_ROOT_FOLDER_ID)
+    # / BrandcommRoot / 2026
+    year_folder = drive_get_or_create_folder(service, year, GDRIVE_ROOT_FOLDER_ID)
 
-    # Client
-    client_folder = drive_create_folder(client_name, deals_root["id"])
+    # / 2026 / <Клиент>
+    client_folder = drive_get_or_create_folder(service, client_name, year_folder["id"])
 
-    # Year
-    year_folder = drive_create_folder(str(year), client_folder["id"])
+    # / 2026 / <Клиент> / <Сделка>_<дата>
+    deal_folder_name = f"{deal_name}_{date_str}"
+    deal_folder = drive_get_or_create_folder(service, deal_folder_name, client_folder["id"])
 
-    # Deal folder
-    deal_folder_name = f"Deal_{date_str}_{deal_name}"
-    deal_folder = drive_create_folder(deal_folder_name, year_folder["id"])
+    # сабпапки внутри сделки
+    subfolder_names = [
+        "01_КП_для клиента",
+        "02_Себестоимость",
+        "03_Договор_и_приложение",
+        "04_Счета_и_закрывашки",
+        "05_Макеты_и_векторы",
+        "06_Закрывашки",
+        "07_Честный_знак",
+        "08_Фото_от_клиента",
+    ]
 
-    # Subfolders
-    sub = {}
-    for subname in ["01_Calc", "02_KP", "03_Contract", "04_TZ"]:
-        sub[subname] = drive_create_folder(subname, deal_folder["id"])
+    subfolders = {}
+    for sf in subfolder_names:
+        subfolders[sf] = drive_get_or_create_folder(service, sf, deal_folder["id"])
 
     return {
-        "deals_root": deals_root,
-        "client_folder": client_folder,
         "year_folder": year_folder,
+        "client_folder": client_folder,
         "deal_folder": deal_folder,
-        "subfolders": sub,
+        "subfolders": subfolders,
     }
 
 
@@ -185,12 +221,8 @@ def build_deal_folders(client_name: str, deal_name: str) -> dict:
 # -------------------------
 def parse_request(text: str) -> tuple[str, str]:
     """
-    Очень простой разбор на старте:
-    - если в тексте есть 'кп' -> считаем это сделкой для КП
-    - иначе всё равно создаём сделку, потому что тестируем систему папок
     Формат:
       "Клиент: РЖД; Сделка: куртки 300"
-    или просто текст — тогда возьмём первые слова.
     """
     t = (text or "").strip()
     client_name = "Client"
@@ -205,8 +237,7 @@ def parse_request(text: str) -> tuple[str, str]:
         deal_name = m2.group(1).strip()
 
     if client_name == "Client":
-        # попробуем выцепить первое "для <клиент>"
-        m3 = re.search(r"для\s+([A-Za-zА-Яа-я0-9\-\s]{2,40})", t, re.IGNORECASE)
+        m3 = re.search(r"для\s+([A-Za-zА-Яа-я0-9\-\s]{2,60})", t, re.IGNORECASE)
         if m3:
             client_name = m3.group(1).strip()
 
@@ -251,7 +282,11 @@ async def telegram_webhook(req: Request):
 
     # commands
     if text.strip().lower() in ["/start", "start"]:
-        await tg_send_message(chat_id, "Я Brandcomm Assistant. Напиши: 'Клиент: РЖД; Сделка: куртки 300' — и я создам папки + запись в Airtable.")
+        await tg_send_message(
+            chat_id,
+            "Я Brandcomm Assistant.\n"
+            "Напиши: Клиент: РЖД; Сделка: куртки 300 — и я создам структуру папок + запись в Airtable."
+        )
         return {"ok": True}
 
     if text.strip().lower() == "/set_webhook":
