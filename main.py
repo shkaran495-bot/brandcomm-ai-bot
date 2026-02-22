@@ -83,13 +83,11 @@ async def airtable_create_deal(client_name: str, deal_name: str, drive_folder_ur
     now = datetime.utcnow().isoformat()
 
     fields = {
-        "Client": client_name,
-        "DealName": deal_name,
-        "DriveFolderUrl": drive_folder_url,
-        "DriveFolderId": drive_folder_id,
-        "Status": "Draft",
-        "CreatedAt": now,
-    }
+    "Client": client_name,
+    "DealName": deal_name,
+    "DriveFolderUrl": drive_folder_url,
+    "DriveFolderId": drive_folder_id,
+}
 
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.post(url, headers=headers, json={"fields": fields})
